@@ -174,16 +174,16 @@ def create_table(conn, hypertables=False):
         logger.debug(f"Executing: {TABLE_SQL}")
         curs.execute(TABLE_SQL)
 
-    if hypertables:
-        try:
-            sql = f"SELECT create_hypertable('teltonika', 'time')"
-            logger.debug(f"Executing: {sql}")
-            curs.execute(sql)
-        except psycopg2.DatabaseError as e:
-            if "already a hypertable" in str(e):
-                logger.debug("Table is already a hypertable")
-            else:
-                raise
+        if hypertables:
+            try:
+                sql = f"SELECT create_hypertable('teltonika', 'time')"
+                logger.debug(f"Executing: {sql}")
+                curs.execute(sql)
+            except psycopg2.DatabaseError as e:
+                if "already a hypertable" in str(e):
+                    logger.debug("Table is already a hypertable")
+                else:
+                    raise
 
 
 def insert(conn, values):
@@ -234,7 +234,6 @@ def main():
         "-K",
         dest="host_key",
         help="The SSH host key. Can also be set with HOST_KEY environment variable",
-        required=True,
     )
 
     parser.add_argument(
@@ -288,9 +287,8 @@ def main():
     else:
         mate3_logger.setLevel(logging.INFO)
 
-    key = paramiko.RSAKey(data=base64.b64decode(args.host_key)) or os.environ.get(
-        "HOST_KEY", ""
-    )
+    key_b64 = args.host_key or os.environ.get("HOST_KEY", None)
+    key = paramiko.RSAKey(data=base64.b64decode(key_b64))
 
     logger.info(f"Connecting to postgres at: {args.database_url}")
     with psycopg2.connect(args.database_url) as conn:
@@ -301,7 +299,7 @@ def main():
             logger.info(f"Connecting to SSH server on teltonika router: {args.host}")
             client.get_host_keys().add(args.host, "ssh-rsa", key)
             client.connect(
-                args.host, username=args.user, password=args.password, allow_agent=False
+                args.host, username=args.user, password=args.password, allow_agent=False, timeout=5
             )
 
             while True:
@@ -310,7 +308,7 @@ def main():
                 command = f"gsmctl {' '.join(ARGUMENTS)}"
                 logger.debug(f"Executing command: {command}")
 
-                stdin, stdout, stderr = client.exec_command(command)
+                stdin, stdout, stderr = client.exec_command(command, timeout=10)
                 stdout = stdout.readlines()
                 stderr = stderr.readlines()
 

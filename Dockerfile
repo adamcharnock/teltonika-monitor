@@ -12,8 +12,6 @@ WORKDIR /code
 ADD pyproject.toml poetry.lock /code/
 RUN poetry install --no-interaction --no-dev
 
-ADD mate3 /code/code
-ADD registry_data /code/registry_data
-ADD pg_config.yaml /code/
+ADD main.py /code
 
-CMD poetry run mate3
+CMD poetry run python main.py
