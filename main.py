@@ -4,6 +4,7 @@ import logging
 import os
 import time
 from sys import argv
+from typing import Tuple, List
 
 import paramiko
 import psycopg2
@@ -38,7 +39,41 @@ ARGUMENTS = [
     "--serving",
 ]
 
-FIELD_NAMES = [s.strip("-") for s in ARGUMENTS] + ["mcc", "mnc", "freq_band_ind"]
+FIELD_NAMES = [
+    "connstate",
+    "netstate",
+    "imei",
+    "iccid",
+    "model",
+    "manuf",
+    "serial",
+    "revision",
+    "imsi",
+    "simstate",
+    "pinstate",
+    "signal",
+    "rscp",
+    "ecio",
+    "rsrp",
+    "sinr",
+    "rsrq",
+    "cellid",
+    "operator",
+    "opernum",
+    "conntype",
+    "temp",
+    "network",
+    "serving",
+    # executed in separate commands
+    "wan0_bsent",
+    "wan0_brecv",
+    "wan1_bsent",
+    "wan1_brecv",
+    # 'serving' also populates the following three fields
+    "mcc",
+    "mnc",
+    "freq_band_ind",
+]
 
 TABLE_SQL = """CREATE TABLE IF NOT EXISTS teltonika (
     time TIMESTAMPTZ NOT NULL,
@@ -68,14 +103,18 @@ TABLE_SQL = """CREATE TABLE IF NOT EXISTS teltonika (
     serving VARCHAR(200),
     mcc INT,
     mnc INT,
-    freq_band_ind INT
+    freq_band_ind INT,
+    wwan0_bsent BIGINT,
+    wwan0_brecv BIGINT,
+    wwan1_bsent BIGINT,
+    wwan1_brecv BIGINT
 )"""
 
 
 def parse_serving(value: str):
     value = value.split(":", 1)[1].strip()
     values = [v.strip('"') for v in value.split(",")]
-    values = [(None if v == "-" else v) for v in values]
+    values = [(None if v in ("-", "N/A") else v) for v in values]
     mode = values[2]
 
     fields_by_mode = {
@@ -196,8 +235,23 @@ def insert(conn, values):
             f"(time, {', '.join(key_values.keys())}) "
             f"VALUES (NOW(), {', '.join(['%s'] * len(key_values))})"
         )
+        args = list(key_values.values())
         logger.debug(f"Executing: {sql}")
-        curs.execute(sql, list(key_values.values()))
+        logger.debug(f"SQL args: {args}")
+        curs.execute(sql, args)
+
+
+def run_command(client, command) -> Tuple[List[str], List[str]]:
+    logger.debug(f"Executing command: {command}")
+
+    stdin, stdout, stderr = client.exec_command(command, timeout=10)
+    stdout = stdout.readlines()
+    stderr = stderr.readlines()
+
+    logger.debug(f"STDOUT: {stdout}")
+    logger.debug(f"STDERR: {stderr}")
+
+    return [s.strip() for s in stdout], [s.strip() for s in stderr]
 
 
 def main():
@@ -299,21 +353,26 @@ def main():
             logger.info(f"Connecting to SSH server on teltonika router: {args.host}")
             client.get_host_keys().add(args.host, "ssh-rsa", key)
             client.connect(
-                args.host, username=args.user, password=args.password, allow_agent=False, timeout=5
+                args.host,
+                username=args.user,
+                password=args.password,
+                allow_agent=False,
+                timeout=5,
             )
 
             while True:
                 start = time.time()
 
                 command = f"gsmctl {' '.join(ARGUMENTS)}"
-                logger.debug(f"Executing command: {command}")
-
-                stdin, stdout, stderr = client.exec_command(command, timeout=10)
-                stdout = stdout.readlines()
-                stderr = stderr.readlines()
-
-                logger.debug(f"STDOUT: {stdout}")
-                logger.debug(f"STDERR: {stderr}")
+                stdout = (
+                    run_command(client, command)[0]
+                    +
+                    # These need to be run in their own commands in order to
+                    # produce reliable data.
+                    # Gets data use
+                    run_command(client, "gsmctl --bsent wwan0 --brecv wwan0")[0]
+                    + run_command(client, "gsmctl --bsent wwan0.1 --brecv wwan0.1")[0]
+                )
 
                 insert(conn, values=[s.strip() for s in stdout])
 
