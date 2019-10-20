@@ -8,9 +8,9 @@ from typing import Tuple, List
 
 import paramiko
 import psycopg2
+from paramiko import SSHException
 
-
-logger = logging.getLogger("teltonika_monitor")
+logger = logging.getLogger("teltonika.monitor")
 
 ARGUMENTS = [
     "--connstate",
@@ -254,6 +254,28 @@ def run_command(client, command) -> Tuple[List[str], List[str]]:
     return [s.strip() for s in stdout], [s.strip() for s in stderr]
 
 
+def one_loop(args, ssh_conn, pg_client):
+    start = time.time()
+
+    command = f"gsmctl {' '.join(ARGUMENTS)}"
+    stdout = (
+            run_command(ssh_conn, command)[0]
+            +
+            # These need to be run in their own commands in order to
+            # produce reliable data.
+            # Gets data use
+            run_command(ssh_conn, "gsmctl --bsent wwan0 --brecv wwan0")[0]
+            + run_command(ssh_conn, "gsmctl --bsent wwan0.1 --brecv wwan0.1")[0]
+    )
+
+    insert(pg_client, values=[s.strip() for s in stdout])
+
+    total = time.time() - start
+    sleep_time = args.interval - total
+    if sleep_time > 0:
+        time.sleep(args.interval - total)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Read available data from a Teltonika router and insert into postgres"
@@ -332,54 +354,49 @@ def main():
         level=logging.ERROR,
     )
     root_logger = logging.getLogger()
-    mate3_logger = logging.getLogger("mate3")
+    teltonika_logger = logging.getLogger("teltonika")
 
     if args.debug:
         root_logger.setLevel(logging.DEBUG)
     elif args.quiet:
-        mate3_logger.setLevel(logging.ERROR)
+        teltonika_logger.setLevel(logging.ERROR)
     else:
-        mate3_logger.setLevel(logging.INFO)
+        teltonika_logger.setLevel(logging.INFO)
 
     key_b64 = args.host_key or os.environ.get("HOST_KEY", None)
-    key = paramiko.RSAKey(data=base64.b64decode(key_b64))
+    ssh_host_key = paramiko.RSAKey(data=base64.b64decode(key_b64))
 
-    logger.info(f"Connecting to postgres at: {args.database_url}")
-    with psycopg2.connect(args.database_url) as conn:
-        conn.autocommit = True
-        create_table(conn, hypertables=args.hypertables)
+    while True:  # Reconnection loop
+        try:
+            logger.info(f"Connecting to postgres at: {args.database_url}")
+            with psycopg2.connect(args.database_url) as pg_client:
+                pg_client.autocommit = True
+                create_table(pg_client, hypertables=args.hypertables)
 
-        with paramiko.SSHClient() as client:
-            logger.info(f"Connecting to SSH server on teltonika router: {args.host}")
-            client.get_host_keys().add(args.host, "ssh-rsa", key)
-            client.connect(
-                args.host,
-                username=args.user,
-                password=args.password,
-                allow_agent=False,
-                timeout=5,
-            )
+                with paramiko.SSHClient() as ssh_conn:
+                    logger.info(f"Connecting to SSH server on teltonika router: {args.host}")
+                    ssh_conn.get_host_keys().add(args.host, "ssh-rsa", ssh_host_key)
+                    ssh_conn.connect(
+                        args.host,
+                        username=args.user,
+                        password=args.password,
+                        allow_agent=False,
+                        timeout=5,
+                    )
+                    logger.info(f"Connection successful. Monitoring will now start")
 
-            while True:
-                start = time.time()
+                    while True:
+                        one_loop(args=args, pg_client=pg_client, ssh_conn=ssh_conn)
 
-                command = f"gsmctl {' '.join(ARGUMENTS)}"
-                stdout = (
-                    run_command(client, command)[0]
-                    +
-                    # These need to be run in their own commands in order to
-                    # produce reliable data.
-                    # Gets data use
-                    run_command(client, "gsmctl --bsent wwan0 --brecv wwan0")[0]
-                    + run_command(client, "gsmctl --bsent wwan0.1 --brecv wwan0.1")[0]
-                )
-
-                insert(conn, values=[s.strip() for s in stdout])
-
-                total = time.time() - start
-                sleep_time = args.interval - total
-                if sleep_time > 0:
-                    time.sleep(args.interval - total)
+        except SSHException as e:
+            logger.error(f"SSH communication error: {e}. Will try to reconnect in {args.interval} seconds")
+            time.sleep(args.interval)
+        except (psycopg2.DatabaseError, psycopg2.OperationalError) as e:
+            logger.error(f"Postgres communication error: {e}. Will try to reconnect in {args.interval} seconds")
+            time.sleep(args.interval)
+        except KeyboardInterrupt:
+            logger.info("Keyboard interrupt received. Exiting")
+            return
 
 
 if __name__ == "__main__":
